@@ -1,0 +1,12 @@
+{
+  "point_id": "P",
+  "device_id": "device-p",
+  "business_day": "2026-11-18",
+  "mixed": [
+    {"line_number": 30, "value": 1, "unit": "L"},
+    {"line_number": 10, "value": 5, "unit": "mL"},
+    {"line_number": 20, "value": null, "unit": "mL", "missing": true}
+  ],
+  "original": [{"line_number": 4, "value": 5, "unit": "mL"}],
+  "followup": [{"line_number": 17, "value": 7, "unit": "mL"}]
+}
