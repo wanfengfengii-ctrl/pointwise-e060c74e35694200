@@ -6,13 +6,16 @@ from tempfile import TemporaryDirectory
 
 from account.day import read_day, read_day_snapshot
 from account.reconcile import reconcile_day
+from archive.cold_storage import ColdSlot, cold_claim, initialize_cold
 from archive.retrieve import claim
 from catalog.lifecycle import PointStatus
 from catalog.registry import initialize_catalog, open_catalog, register
 from catalog.retirement import retire
+from cold_fixture import Mailbox, seed
 from intake.rows import SourceRow
 from intake.staging import stage
 from publication.admission import RetiredPoint, seal
+from publication.cold_handoff import TransferDesk, initialize_source
 from publication.storage import initialize_warehouse, open_warehouse
 
 
@@ -154,11 +157,66 @@ def admission_first(root, sample):
               'Two admitted rows contribute 5 + 7 mL. The sample fixes source line 17 for F.')
 
 
+def cold_handoff_reuse(root, sample):
+    point_id, business_day = sample['point_id'], sample['business_day']
+    with databases(root, create=True) as (catalog, warehouse):
+        cold_dir = root / 'cold-store'
+        cold_dir.mkdir()
+        cold_path = cold_dir / 'cold.sqlite3'
+        receipts = seed(catalog, warehouse)
+        initialize_source(warehouse)
+        cold = open_warehouse(cold_path)
+        try:
+            initialize_cold(cold)
+            mailbox = Mailbox(ColdSlot(cold).receive)
+            desk = TransferDesk(warehouse, mailbox)
+            desk.open_transfer('A', receipts['A'])
+            mailbox.lose_next_reply('write')
+            lost = desk.advance('A')
+            equal(lost.state, 'pending', 'A write reply lost')
+            cancelled = desk.cancel('A')
+            equal(cancelled.state, 'cancelled', 'A cancel ruling')
+            desk.open_transfer('B', receipts['B'])
+            confirmed = desk.advance('B')
+            equal(confirmed.state, 'confirmed', 'B confirmed in the reused slot')
+            old_write = mailbox.lost_replies[0][0]
+            mailbox.deliver(old_write)
+            equal(desk.status('A').state, 'cancelled', 'A stays cancelled after its late write')
+            first_receipt = confirmed.receipt
+        finally:
+            cold.close()
+    # Source and catalog are closed; reopen only the cold store and claim B's original.
+    with closing(open_warehouse(cold_path)) as cold:
+        claimed = cold_claim(cold, first_receipt)
+        cold_rows = [[row.line_number, row.value, row.unit, row.missing] for row in claimed.rows]
+        equal(cold_rows, [[4, 11, 'mL', False]], 'B original row from cold storage')
+        equal(claimed.receipt_id, receipts['B'], 'cold claim source receipt')
+    with databases(root) as (catalog, warehouse):
+        account = read_day(catalog, warehouse, point_id, business_day)
+        equal(metrics(account), [2, 18], 'source day account after cold handoff')
+        snapshot = read_day_snapshot(catalog, warehouse, point_id, business_day)
+        issues = reconcile_day(warehouse, snapshot)
+        equal(issues, (), 'source reconciliation after cold handoff')
+        scene('cold-slot-reuse',
+              {'point_id': point_id, 'business_day': business_day,
+               'a_ml': 7, 'b_ml': 11, 'first': 'cancel'},
+              {'a': 'cancelled', 'b': 'confirmed', 'day': [2, 18]},
+              {'a': cancelled.state, 'b': confirmed.state, 'day': metrics(account)},
+              {'rows': [[4, 11, 'mL', False]], 'issues': 0},
+              {'rows': cold_rows, 'issues': len(issues)},
+              ['publication/cold_handoff.py', 'archive/cold_storage.py',
+               'archive/retrieve.py', 'account/day.py'],
+              'A wrote 7 mL but lost the reply and was cancelled, so B took the only slot. '
+              'A late write changes nothing, the reopened cold store claims B line 4, 11 mL, '
+              'and the source day still totals 18 mL.')
+
+
 def run(root):
     sample = json.loads(Path(__file__).with_name('sample.json').read_text(encoding='utf-8'))
     mixed_day(root / 'mixed-day', sample)
     retirement_first(root / 'retirement-first', sample)
     admission_first(root / 'admission-first', sample)
+    cold_handoff_reuse(root / 'cold-handoff', sample)
 
 
 def main():
